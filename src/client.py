@@ -1,229 +1,170 @@
+"""
+Battleship game client implementation
+"""
+
 import socket
 import argparse
-import numpy as np
-import re
-import random
 import sys
+import logging
+from typing import Optional, List
+import random
 
-class Battleship:
-    """
-    Class representing Battleship game board for client
-    """
+from protocol import (
+    MessageType, create_message, parse_message, 
+    validate_coordinate, ProtocolError, InvalidMessageError
+)
+from game_model import GameBoard, CellState
 
-    GRID_SIZE = 9
-    ALPHABET = [chr(i) for i in range(65, 65 + GRID_SIZE)] # ['A', 'B', ...,'I']
-    COORD_PATTERN = re.compile(r'^[A-I][1-9]$') # Valid coordinates: e.g., 'A1\n', 'E8\n'
-
-    def __init__(self):
-        # Board initialisation: '.' indicates un unshot cell
-        self.board = np.full((self.GRID_SIZE, self.GRID_SIZE), '.', dtype=str)
-        self.shot_count = 0   # Number of valid shots fired
-        self.hit_count = 0    # Number of succesful shots
-
-    def __str__(self):
-        return self.get_board()
-    
-    def get_board(self):
-        """
-        Returns a string representation of the current board state
-        """
-        rows = ['  ' + ' '.join(self.ALPHABET)] # Column headers A-I
-        for i in range(self.GRID_SIZE):
-            row = f"{i + 1} " + ' '.join(self.board[:, i]) # Each row with its number
-            rows.append(row)
-        return '\n'.join(rows) + '\n'
-    
-
-    def set_board(self, coord, value):
-        """
-        Marks a cell withy a given value ('X' for hit, 'O' for miss)
-        """
-        x, y = self.coord_to_indicies(coord)
-        if self.board[x, y] == '.':
-            self.board[x, y] = value
-        else:
-            print('Coordinate already shot')
-        
-        self.shot_count += 1
-
-    def game_over(self):
-        """
-        Return True if all ship parts (14) have been hit
-        """
-        return self.hit_count >= 14
-    
-    @classmethod
-    def coord_to_indicies(cls, coord):
-        """
-        Converts a coordinate string (e.g., 'C6') to board indicies
-        """
-        col = cls.ALPHABET.index(coord[0])
-        row = int(coord[1]) - 1
-        return col, row
-    
-    @classmethod
-    def is_valid_coord(cls, coord):
-        """
-        Validates the coordinate format
-        """
-        return bool(cls.COORD_PATTERN.match(coord))
-    
-    def get_score(self):
-        """
-        Returns the number of shots taken
-        """
-        return self.shot_count
-
-    @classmethod
-    def generate_random_shots(cls):
-        """
-        Generates all possible coordinates in random order.
-
-        NOTE: This method was created to enable quick testing of end game 
-        state without the need to manually play the game to completion.
-        As will all other references to 'auto mode', it is not strickly 
-        necessary for this assignment, so it can be ignored.
-        """
-        all_coords = [f'{c}{n}' for c in cls.ALPHABET for n in range(1, cls.GRID_SIZE + 1)]
-        random.shuffle(all_coords)
-        return all_coords
-    
-
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class BattleshipClient:
     """
-    Client class for connecting and playing the Battleship game
+    Client for connecting and playing the Battleship game
     """
-    def __init__(self, host='localhost', port=5050, auto=False):
+    def __init__(self, host: str = 'localhost', port: int = 5050, auto: bool = False):
         self.host = host
         self.port = port
-        self.game = Battleship()
-        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.auto = auto
+        self.game = GameBoard()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        # For auto mode
+        self.shots: List[str] = []
+        self.shot_index: int = 0
+        if auto:
+            self._generate_shots()
 
-        # The following are used in auto mode only (FOR TESTING -- not part of the assignment specs)
-        self.auto = auto # If true, the client automatically fires shots
-        self.shots = Battleship.generate_random_shots()
-        self.shot_index = 0
+    def _generate_shots(self) -> None:
+        """Generate all possible coordinates in random order for auto mode"""
+        self.shots = [f'{c}{n}' for c in GameBoard.ALPHABET 
+                     for n in range(1, GameBoard.GRID_SIZE + 1)]
+        random.shuffle(self.shots)
 
-    def connect(self):
-        """
-        Attempts to onnect to the server at the given host and port
-        """
+    def connect(self) -> None:
+        """Connect to the server"""
         try:
-            self.client.connect((self.host, self.port))
-            print(f'Connected to {self.host}:{self.port}')
+            self.socket.connect((self.host, self.port))
+            logger.info(f'Connected to {self.host}:{self.port}')
         except Exception as e:
-            print(f'Connection failed: {e}')
+            logger.error(f"Connection failed: {e}")
             sys.exit(1)
 
-    def start_game(self):
-        """
-        Starts the game handshake with the server
-        """
-        self.client.send(b'START GAME\n')
+    def send_message(self, msg_type: MessageType, data: Optional[dict] = None) -> None:
+        """Send a protocol message to the server"""
+        try:
+            message = create_message(msg_type, data)
+            self.socket.sendall(message.encode())
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+            raise
 
-        # Expect 'POSITIONING SHIPS' message
-        data = self.client.recv(20).decode()
-        data = data if data else 'null'
-        if data != 'POSITIONING SHIPS\n':
-            print('Error using socket. Closing connection...')
-            print(f'Invalid message from server. Expected POSITIONING SHIPS but received {data}')
-            self.client.close()
-            sys.exit(1)
+    def receive_message(self) -> tuple[MessageType, dict]:
+        """Receive and parse a protocol message from the server"""
+        try:
+            data = self.socket.recv(1024).decode()
+            if not data:
+                raise ConnectionError("Server disconnected")
+            return parse_message(data)
+        except Exception as e:
+            logger.error(f"Failed to receive message: {e}")
+            raise
 
-        # Expect 'SHIPS IN POSITION' message
-        data = self.client.recv(20).decode()
-        data = data if data else 'null'
-        if data != 'SHIPS IN POSITION\n':
-            print('Error using socket. Closing connection...')
-            print(f'Invalid message from server. Expected SHIPS IN POSITION but received {data}')
-            self.client.close()
-            sys.exit(1)
-
-
-    def get_next_shot(self):
-        """
-        Gets the next coordinate to fire at.
-        Either from user input or automaticaly if auto mode enabled (for TESTING ONLY)
-        """
-
+    def get_next_shot(self) -> str:
+        """Get the next coordinate to fire at"""
         if self.auto:
-            # If auto enabled
             coord = self.shots[self.shot_index]
             self.shot_index += 1
-            print(f'Auto-shoot: {coord}')
+            logger.info(f'Auto-shoot: {coord}')
             return coord
-        else:
-            # Otherwise take input from the user
-            try:
-                return input('Enter coordinates to shoot: ').upper()
-            except KeyboardInterrupt:
-                self.client.close()
-                print()
-                sys.exit(1)
         
-    def play_turn(self, coord):
-        """
-        Sends a shot to the server ad updates the board based on the response
-        """
-        self.client.send(f'{coord}\n'.encode())
-        response = self.client.recv(20).decode()
+        while True:
+            try:
+                coord = input('Enter coordinates to shoot (e.g., A1): ').upper()
+                if validate_coordinate(coord):
+                    return coord
+                logger.warning("Invalid coordinate format. Please use format A1-I9")
+            except KeyboardInterrupt:
+                logger.info("\nGame terminated by user")
+                self.socket.close()
+                sys.exit(0)
 
-        if response == 'MISS\n':
-            self.game.set_board(coord, 'O')
-        elif response == 'HIT\n':
-            self.game.set_board(coord, 'X')
-            self.game.hit_count += 1
-        else:
-            print(f'Error using socket. Closing connection...')
-            self.client.close()
-            sys.exit(1)
+    def display_board(self) -> None:
+        """Display the current state of the game board"""
+        print("\n  " + " ".join(GameBoard.ALPHABET))
+        for i in range(GameBoard.GRID_SIZE):
+            row = f"{i + 1} "
+            for j in range(GameBoard.GRID_SIZE):
+                state = self.game.get_state_at(f"{GameBoard.ALPHABET[j]}{i+1}")
+                if state == CellState.HIT:
+                    row += "X "
+                elif state == CellState.MISS:
+                    row += "O "
+                else:
+                    row += ". "
+            print(row)
+        print()
 
+    def play(self) -> None:
+        """Main gameplay loop"""
+        try:
+            self.connect()
+            
+            # Start game handshake
+            self.send_message(MessageType.START_GAME)
+            
+            # Wait for server to position ships
+            msg_type, _ = self.receive_message()
+            if msg_type != MessageType.POSITIONING_SHIPS:
+                raise InvalidMessageError(f"Expected POSITIONING_SHIPS, got {msg_type}")
+            
+            msg_type, _ = self.receive_message()
+            if msg_type != MessageType.SHIPS_IN_POSITION:
+                raise InvalidMessageError(f"Expected SHIPS_IN_POSITION, got {msg_type}")
 
-    def play(self):
-        """
-        Main gameplay loop: handles game progression
-        """
-        self.connect() # Connect to server
-        self.start_game() # Game handshake with server
+            # Main game loop
+            while True:
+                self.display_board()
+                coord = self.get_next_shot()
+                
+                # Send shot
+                self.send_message(MessageType.SHOT, {'coordinate': coord})
+                
+                # Process response
+                msg_type, data = self.receive_message()
+                if msg_type == MessageType.ERROR:
+                    logger.error(f"Server error: {data.get('message', 'Unknown error')}")
+                    continue
+                
+                is_hit = msg_type == MessageType.HIT
+                self.game.process_shot(coord)
+                
+                if msg_type == MessageType.GAME_OVER:
+                    score = data.get('score', 0)
+                    logger.info(f"Game over! Final score: {score}")
+                    break
 
-        while not self.game.game_over():
-            print(self.game)
-            coord = self.get_next_shot()
-
-            if not Battleship.is_valid_coord(coord):
-                print('Invalid Coordinates!\n')
-                continue
-
-            self.play_turn(coord)
-
-        # After game over, validate final score
-        print(self.game)
-        final_score = int(self.client.recv(20).decode())
-        assert final_score == self.game.get_score()
-        print(f'You won! Final score: {final_score}\n')
-        self.client.close()
-
-
+        except ProtocolError as e:
+            logger.error(f"Protocol error: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+        finally:
+            self.socket.close()
 
 def main():
-    """
-    Parses command line arguments and starts the Battleship client
-    """
-    parser = argparse.ArgumentParser(
-        prog='Battleship Game',
-        description='Destroy all the ships in the least number of shots.'
-    )
-    parser.add_argument('host', type=str, nargs='?', default='localhost', help='Server hostname')
-    parser.add_argument('port', type=int, nargs='?', default=5050, help='Server port')
-
-    # Enable automatic shooting for testing purposes (use --auto flag when running the script)
-    parser.add_argument('--auto', action='store_true', help='Automatically enter shots (for testing)')
+    """Parse arguments and start the Battleship client"""
+    parser = argparse.ArgumentParser(description='Battleship game client')
+    parser.add_argument('--host', default='localhost', help='Server hostname')
+    parser.add_argument('--port', type=int, default=5050, help='Server port')
+    parser.add_argument('--auto', action='store_true', help='Enable auto mode')
     args = parser.parse_args()
 
     client = BattleshipClient(host=args.host, port=args.port, auto=args.auto)
     client.play()
-
 
 if __name__ == '__main__':
     main()
